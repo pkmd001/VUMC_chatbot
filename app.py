@@ -1,5 +1,5 @@
 import streamlit as st
-import openai
+from openai import OpenAI
 import requests
 import PyPDF2
 import pdfplumber
@@ -13,6 +13,7 @@ from typing import List, Dict, Optional, Tuple
 import base64
 import os
 from datetime import datetime
+import io
 
 # Page configuration
 st.set_page_config(
@@ -84,8 +85,6 @@ if 'text_chunks' not in st.session_state:
     st.session_state.text_chunks = []
 if 'chunk_metadata' not in st.session_state:
     st.session_state.chunk_metadata = []
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = ""
 
 # Guidelines dictionary
 GUIDELINES = {
@@ -123,7 +122,6 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     
     # Try pdfplumber first
     try:
-        import io
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text()
@@ -134,7 +132,6 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
         
         # Fallback to PyPDF2
         try:
-            import io
             pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
             for page in pdf_reader.pages:
                 text += page.extract_text() + "\n"
@@ -232,8 +229,22 @@ def semantic_search(query: str, top_k: int = 3) -> List[Tuple[str, Dict]]:
     
     return results
 
-def chat_with_context(query: str, api_key: str) -> str:
+def get_api_key():
+    """Get API key from Streamlit secrets or user input."""
+    # First check if it's in secrets
+    try:
+        return st.secrets["OPENAI_API_KEY"]
+    except:
+        # If not in secrets, check session state
+        return st.session_state.get('api_key', '')
+
+def chat_with_context(query: str) -> Tuple[str, set]:
     """Process query using PDF content context."""
+    # Get API key
+    api_key = get_api_key()
+    if not api_key:
+        return "Please provide an OpenAI API key in the sidebar or add it to Streamlit secrets.", set()
+    
     # Search for relevant content
     relevant_chunks = semantic_search(query, top_k=3)
     
@@ -260,8 +271,10 @@ Question: {query}
 Please provide a clear, concise answer based on the context above. Cite the specific guideline(s) used."""
 
     try:
-        openai.api_key = api_key
-        response = openai.ChatCompletion.create(
+        # Initialize OpenAI client with new syntax
+        client = OpenAI(api_key=api_key)
+        
+        response = client.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -271,7 +284,7 @@ Please provide a clear, concise answer based on the context above. Cite the spec
             max_tokens=500
         )
         
-        answer = response['choices'][0]['message']['content']
+        answer = response.choices[0].message.content
         
         # Add source information
         if sources:
@@ -280,29 +293,48 @@ Please provide a clear, concise answer based on the context above. Cite the spec
         return answer, sources
         
     except Exception as e:
-        return f"Error: {str(e)}", []
+        return f"Error: {str(e)}", set()
 
 # Header
 st.title("🏥 VUMC Trauma Guidelines Assistant")
 st.caption("Ask questions about VUMC trauma and surgical critical care guidelines")
 
+# Check if API key is available
+has_api_key = bool(get_api_key())
+
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
     
-    # API Key input
-    api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        value=st.session_state.api_key,
-        help="Enter your OpenAI API key to enable the chatbot"
-    )
-    
-    if api_key:
-        st.session_state.api_key = api_key
-        st.success("✅ API Key set!")
+    # API Key section
+    if not has_api_key:
+        st.info("💡 You can set your OpenAI API key in two ways:")
+        st.markdown("""
+        1. **Recommended**: Add to Streamlit secrets
+        2. **Alternative**: Enter below (session only)
+        """)
+        
+        # API Key input
+        api_key_input = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            help="Enter your OpenAI API key to enable the chatbot"
+        )
+        
+        if api_key_input:
+            st.session_state.api_key = api_key_input
+            st.success("✅ API Key set for this session!")
+            st.rerun()
     else:
-        st.warning("⚠️ Please enter your API key")
+        st.success("✅ API Key configured!")
+        
+        # Add option to override with session key
+        with st.expander("Change API Key"):
+            new_key = st.text_input("New API Key", type="password")
+            if new_key:
+                st.session_state.api_key = new_key
+                st.success("✅ Using new API key for this session")
+                st.rerun()
     
     st.divider()
     
@@ -310,7 +342,7 @@ with st.sidebar:
     st.header("📄 PDF Guidelines")
     
     if not st.session_state.pdf_loaded:
-        if st.button("🔄 Load All PDFs", type="primary", disabled=not api_key):
+        if st.button("🔄 Load All PDFs", type="primary", disabled=not has_api_key):
             with st.spinner("Loading PDFs... This may take a few minutes"):
                 load_pdfs_and_create_index()
     else:
@@ -322,7 +354,7 @@ with st.sidebar:
             st.session_state.embeddings_index = None
             st.session_state.text_chunks = []
             st.session_state.chunk_metadata = []
-            st.experimental_rerun()
+            st.rerun()
     
     st.divider()
     
@@ -339,7 +371,7 @@ with st.sidebar:
     for question in quick_questions:
         if st.button(question, key=f"quick_{question}"):
             st.session_state.messages.append({"role": "user", "content": question})
-            st.experimental_rerun()
+            st.rerun()
     
     st.divider()
     
@@ -361,7 +393,7 @@ for message in st.session_state.messages:
                    unsafe_allow_html=True)
 
 # Chat input
-if api_key and st.session_state.pdf_loaded:
+if has_api_key and st.session_state.pdf_loaded:
     user_input = st.chat_input("Ask about trauma guidelines...")
     
     if user_input:
@@ -370,15 +402,32 @@ if api_key and st.session_state.pdf_loaded:
         
         # Process with loading spinner
         with st.spinner("Thinking..."):
-            response, sources = chat_with_context(user_input, api_key)
+            response, sources = chat_with_context(user_input)
         
         # Add bot response
         st.session_state.messages.append({"role": "assistant", "content": response})
         
-        st.experimental_rerun()
+        st.rerun()
 
-elif not api_key:
-    st.info("👈 Please enter your OpenAI API key in the sidebar to begin")
+elif not has_api_key:
+    st.info("👈 Please add your OpenAI API key to Streamlit secrets or enter it in the sidebar")
+    
+    with st.expander("📝 How to add API key to Streamlit secrets"):
+        st.markdown("""
+        **For Streamlit Cloud deployment:**
+        1. Go to your app settings in Streamlit Cloud
+        2. Navigate to Secrets section
+        3. Add the following:
+        ```toml
+        OPENAI_API_KEY = "your-api-key-here"
+        ```
+        
+        **For local development:**
+        1. Create `.streamlit/secrets.toml` in your project root
+        2. Add the same content as above
+        3. Make sure to add `secrets.toml` to `.gitignore`
+        """)
+        
 elif not st.session_state.pdf_loaded:
     st.info("👈 Please load the PDF guidelines in the sidebar to begin")
 
@@ -392,22 +441,15 @@ with st.expander("📱 Mobile Usage Tips"):
     4. Voice input: Use your keyboard's voice-to-text feature
     
     **How to use:**
-    1. Enter your OpenAI API key (saved locally)
+    1. API key will be loaded from Streamlit secrets (or enter manually)
     2. Click "Load All PDFs" (one-time setup)
     3. Ask questions in the chat or use quick questions
     4. Get answers based on actual VUMC guidelines!
     """)
 
-# Requirements.txt content
-st.sidebar.divider()
-if st.sidebar.button("📋 Show requirements.txt"):
-    st.sidebar.code("""
-streamlit
-openai
-PyPDF2
-pdfplumber
-sentence-transformers
-faiss-cpu
-numpy
-requests
-    """, language="text")
+# Display current configuration (for debugging)
+with st.sidebar.expander("🔧 Debug Info"):
+    st.write("API Key configured:", has_api_key)
+    st.write("PDFs loaded:", st.session_state.pdf_loaded)
+    if st.session_state.pdf_loaded:
+        st.write("Total chunks:", len(st.session_state.text_chunks))
